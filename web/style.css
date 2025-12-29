@@ -1,0 +1,7 @@
+:root{ --size:64px; --light:#f0d9b5; --dark:#b58863; }
+body{display:flex;justify-content:center;padding:20px;font-family:sans-serif;background:#eee}
+.board{display:grid;grid-template-columns:repeat(8,var(--size));grid-template-rows:repeat(8,var(--size));border:2px solid #333}
+.square{display:flex;align-items:center;justify-content:center;font-size:36px}
+.square.light{background:var(--light)}
+.square.dark{background:var(--dark)}
+.square[data-square]{width:var(--size);height:var(--size)}
