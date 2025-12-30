@@ -9,7 +9,6 @@
 #include <chrono>
 #include <unordered_map>
 #include <cmath>
-
 using Board = std::array<char, 64>;
 
 struct Move
