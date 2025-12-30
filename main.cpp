@@ -9,6 +9,9 @@
 #include <chrono>
 #include <unordered_map>
 #include <cmath>
+#include <filesystem>
+#include <ctime>
+#include <cstdio>
 using Board = std::array<char, 64>;
 
 struct Move
@@ -287,6 +290,47 @@ int evaluate(const Board &board)
         }
     }
     std::cout << "White Material: " << whiteScore << "  Black Material: " << blackScore << std::endl;
+    return whiteScore - blackScore;
+}
+
+// material balance (white - black) without debug output
+int materialBalance(const Board &board)
+{
+    int whiteScore = 0, blackScore = 0;
+    for (char p : board)
+    {
+        switch (p)
+        {
+        case 'P':
+            whiteScore += 1;
+            break;
+        case 'N':
+        case 'B':
+            whiteScore += 3;
+            break;
+        case 'R':
+            whiteScore += 5;
+            break;
+        case 'Q':
+            whiteScore += 9;
+            break;
+        case 'p':
+            blackScore += 1;
+            break;
+        case 'n':
+        case 'b':
+            blackScore += 3;
+            break;
+        case 'r':
+            blackScore += 5;
+            break;
+        case 'q':
+            blackScore += 9;
+            break;
+        default:
+            break;
+        }
+    }
     return whiteScore - blackScore;
 }
 
@@ -649,6 +693,200 @@ void generateLegalMoves(const GameState &gs, bool whiteTurn, std::vector<Move> &
     }
 }
 
+// Check whether making move `m` from `gs` allows an immediate opponent capture on m.to
+// that results in a material swing <= threshold (from mover's perspective).
+bool allowsBadImmediateRecapture(const GameState &gs, const Move &m, bool whiteTurn, int threshold)
+{
+    GameState ng = applyMove(gs, m);
+    bool oppWhite = !whiteTurn;
+    std::vector<Move> oppMoves;
+    generateLegalMoves(ng, oppWhite, oppMoves);
+    int before = materialBalance(gs.board);
+    for (auto &r : oppMoves)
+    {
+        if (!r.isCapture)
+            continue;
+        if (r.to != m.to)
+            continue;
+        GameState ng2 = applyMove(ng, r);
+        int after = materialBalance(ng2.board);
+        int deltaWhite = after - before;
+        int deltaForMover = whiteTurn ? deltaWhite : -deltaWhite;
+        if (deltaForMover <= threshold)
+            return true;
+    }
+    return false;
+}
+
+// Aggressive evaluation: only counts capture opportunities and center control for side to move.
+int evaluateAggressive(const GameState &gs, bool whiteTurn)
+{
+    std::vector<Move> moves;
+    generateLegalMoves(gs, whiteTurn, moves);
+    int captureCount = 0;
+    for (auto &m : moves)
+        if (m.isCapture)
+            ++captureCount;
+
+    // center squares: d4,e4,d5,e5 -> indices 27,28,35,36
+    const int centerIdx[4] = {27, 28, 35, 36};
+    int centerControl = 0;
+    for (int ci = 0; ci < 4; ++ci)
+    {
+        char c = gs.board[centerIdx[ci]];
+        if (c == '.')
+            continue;
+        if (whiteTurn && isWhite(c))
+            centerControl += 1;
+        if (!whiteTurn && isBlack(c))
+            centerControl += 1;
+    }
+
+    // score oriented to side-to-move (higher is better)
+    return captureCount * 800 + centerControl * 120;
+}
+
+// Move ordering heuristic: prefer captures, then pawn double pushes on c/d/e, then center moves
+// forward declare helper used by moveHeuristic
+bool squareAttackedByAfterMove(const GameState &gs, const Move &m, bool byWhite);
+
+int moveHeuristic(const GameState &gs, const Move &m)
+{
+    int score = 0;
+    if (m.isCapture)
+    {
+        score += 20000; // huge priority for captures
+        // penalize captures that leave the capturing piece on a square defended by the opponent
+        if (squareAttackedByAfterMove(gs, m, !isWhite(gs.board[m.from])))
+            score -= 15000; // discourage capturing a defended piece
+    }
+
+    // center target bonus
+    if (m.to == 27 || m.to == 28 || m.to == 35 || m.to == 36)
+        score += 500;
+
+    // prefer two-step pawn pushes on files c(2)/d(3)/e(4)
+    int fromFile = m.from % 8;
+    if (abs(m.to - m.from) == 16)
+    {
+        // verify it's a pawn by checking piece on source in current gs
+        char piece = gs.board[m.from];
+        if (piece == 'P' || piece == 'p')
+        {
+            if (fromFile == 2 || fromFile == 3 || fromFile == 4)
+                score += 5000; // very desirable
+        }
+    }
+    return score;
+}
+
+// Determine if the square 'sq' is attacked by side 'byWhite' (wrapper of isSquareAttacked)
+bool squareAttackedByAfterMove(const GameState &gs, const Move &m, bool byWhite)
+{
+    GameState ng = applyMove(gs, m);
+    return isSquareAttacked(ng.board, m.to, byWhite);
+}
+
+int negamax(const GameState &gs, bool whiteTurn, int depth, int alpha, int beta)
+{
+    if (depth == 0)
+        return evaluateAggressive(gs, whiteTurn);
+
+    std::vector<Move> moves;
+    generateLegalMoves(gs, whiteTurn, moves);
+    if (moves.empty())
+    {
+        int kingSq = findKingSquare(gs.board, whiteTurn);
+        bool inCheck = (kingSq != -1) && isSquareAttacked(gs.board, kingSq, !whiteTurn);
+        if (inCheck)
+            return -100000 + (3 - depth); // checkmate worse for side to move
+        else
+            return 0; // stalemate
+    }
+
+    // order moves by heuristic descending
+    std::sort(moves.begin(), moves.end(), [&](const Move &a, const Move &b)
+              { return moveHeuristic(gs, a) > moveHeuristic(gs, b); });
+
+    int best = -1000000;
+    for (auto &m : moves)
+    {
+        GameState ng = applyMove(gs, m);
+        // avoid immediate large material loss in deeper search as well
+        int deltaWhite = materialBalance(ng.board) - materialBalance(gs.board);
+        int deltaForSide = whiteTurn ? deltaWhite : -deltaWhite;
+        if (deltaForSide <= -4)
+            continue;
+        if (allowsBadImmediateRecapture(gs, m, whiteTurn, -4))
+            continue;
+
+        int val = -negamax(ng, !whiteTurn, depth - 1, -beta, -alpha);
+        if (val > best)
+            best = val;
+        if (best > alpha)
+            alpha = best;
+        if (alpha >= beta)
+            break;
+    }
+    return best;
+}
+
+Move searchBestMove(const GameState &gs, bool whiteTurn, int depth)
+{
+    std::vector<Move> moves;
+    generateLegalMoves(gs, whiteTurn, moves);
+    if (moves.empty())
+        return {0, 0, false, '\0'};
+
+    // order moves by heuristic
+    std::sort(moves.begin(), moves.end(), [&](const Move &a, const Move &b)
+              { return moveHeuristic(gs, a) > moveHeuristic(gs, b); });
+    // avoid immediate large material loss: threshold is material points (side-perspective)
+    const int materialLossThreshold = -4; // disallow moves that immediately lose >= 4 points
+    int skipped = 0;
+    Move bestMove = moves[0];
+    int alpha = -1000000, beta = 1000000;
+    for (auto &m : moves)
+    {
+        GameState ng = applyMove(gs, m);
+        int deltaWhite = materialBalance(ng.board) - materialBalance(gs.board);
+        int deltaForSide = whiteTurn ? deltaWhite : -deltaWhite;
+        if (deltaForSide <= materialLossThreshold)
+        {
+            ++skipped;
+            continue;
+        }
+        // also check for immediate recapture by opponent that causes large loss
+        if (allowsBadImmediateRecapture(gs, m, whiteTurn, materialLossThreshold))
+        {
+            ++skipped;
+            continue;
+        }
+        int val = -negamax(ng, !whiteTurn, depth - 1, -beta, -alpha);
+        if (val > alpha)
+        {
+            alpha = val;
+            bestMove = m;
+        }
+    }
+    // if we skipped all moves, allow them (no legal safe move)
+    if (skipped == (int)moves.size())
+    {
+        alpha = -1000000;
+        for (auto &m : moves)
+        {
+            GameState ng = applyMove(gs, m);
+            int val = -negamax(ng, !whiteTurn, depth - 1, -beta, -alpha);
+            if (val > alpha)
+            {
+                alpha = val;
+                bestMove = m;
+            }
+        }
+    }
+    return bestMove;
+}
+
 int main()
 {
     // Setup board
@@ -707,6 +945,9 @@ int main()
     // record initial position
     repetitionCount[positionKey(gs, whiteTurn)] = 1;
 
+    std::vector<std::string> pgnMoves;
+    std::string gameResult = "*";
+
     for (; turn < maxPlies; ++turn)
     {
         std::vector<Move> legal;
@@ -716,33 +957,87 @@ int main()
             int kingSq = findKingSquare(gs.board, whiteTurn);
             bool inCheck = (kingSq != -1) && isSquareAttacked(gs.board, kingSq, !whiteTurn);
             if (inCheck)
+            {
                 std::cout << (whiteTurn ? "White" : "Black") << " is checkmated!\n";
+                gameResult = whiteTurn ? "0-1" : "1-0";
+            }
             else
+            {
                 std::cout << (whiteTurn ? "White" : "Black") << " has no legal moves (stalemate)!\n";
+                gameResult = "1/2-1/2";
+            }
             break;
         }
 
-        // pick best move greedily by material
-        int bestScore = whiteTurn ? -1000 : 1000;
-        Move bestMove = legal[0];
-        for (auto &m : legal)
-        {
-            GameState ng = applyMove(gs, m);
-            int score = evaluate(ng.board);
-            if (whiteTurn && score > bestScore)
-            {
-                bestScore = score;
-                bestMove = m;
-            }
-            if (!whiteTurn && score < bestScore)
-            {
-                bestScore = score;
-                bestMove = m;
-            }
-        }
+        // pick best move using negamax alpha-beta with aggressive priorities
+        const int searchDepth = 3; // tune depth as desired
+        Move bestMove = searchBestMove(gs, whiteTurn, searchDepth);
 
         std::cout << "\n"
                   << (whiteTurn ? "White" : "Black") << " plays: " << squareName(bestMove.from) << " -> " << squareName(bestMove.to) << "\n";
+
+        // SAN generation (simple): castling, piece letter, captures, promotions, check/mate marker
+        auto moveToSAN = [&](const GameState &curGs, const Move &m, bool curWhite) -> std::string
+        {
+            char piece = curGs.board[m.from];
+            // castling
+            if ((piece == 'K' || piece == 'k') && abs((m.to % 8) - (m.from % 8)) == 2)
+            {
+                if ((m.to % 8) == 6)
+                    return std::string("O-O");
+                else
+                    return std::string("O-O-O");
+            }
+            std::string san;
+            bool isPawn = (piece == 'P' || piece == 'p');
+            if (isPawn)
+            {
+                if (m.isCapture)
+                {
+                    char file = 'a' + (m.from % 8);
+                    san.push_back(file);
+                    san.push_back('x');
+                }
+                san += squareName(m.to);
+                if (m.promotion != '\0')
+                {
+                    san.push_back('=');
+                    san.push_back((char)toupper((unsigned char)m.promotion));
+                }
+            }
+            else
+            {
+                // ensure piece letter is present; if source square somehow empty, attempt to infer
+                char up = '?';
+                if (piece != '.' && piece != '\0')
+                    up = (char)toupper((unsigned char)piece);
+                else
+                {
+                    // fallback: infer by scanning legal pieces that could move to m.from (best-effort)
+                    up = 'P';
+                }
+                san.push_back(up);
+                if (m.isCapture)
+                    san.push_back('x');
+                san += squareName(m.to);
+            }
+
+            // check/mate detection
+            GameState ng = applyMove(curGs, m);
+            bool oppIsWhite = !curWhite;
+            int oppKing = findKingSquare(ng.board, oppIsWhite);
+            bool inCheck = (oppKing != -1) && isSquareAttacked(ng.board, oppKing, curWhite);
+            std::vector<Move> oppMoves;
+            generateLegalMoves(ng, oppIsWhite, oppMoves);
+            if (inCheck && oppMoves.empty())
+                san += '#';
+            else if (inCheck)
+                san += '+';
+
+            return san;
+        };
+
+        std::string san = moveToSAN(gs, bestMove, whiteTurn);
 
         // update halfmove clock: reset on pawn move or capture
         char movingPiece = gs.board[bestMove.from];
@@ -751,7 +1046,11 @@ int main()
         else
             ++halfmoveClock;
 
+        // apply move and record SAN
+        GameState oldGs = gs;
         gs = applyMove(gs, bestMove);
+        pgnMoves.push_back(san);
+
         // toggle side to move
         whiteTurn = !whiteTurn;
 
@@ -768,6 +1067,7 @@ int main()
         if (cnt >= 3)
         {
             std::cout << "Draw by threefold repetition.\n";
+            gameResult = "1/2-1/2";
             break;
         }
 
@@ -775,7 +1075,59 @@ int main()
         if (halfmoveClock >= 100)
         {
             std::cout << "Draw by 50-move rule.\n";
+            gameResult = "1/2-1/2";
             break;
+        }
+    }
+
+    // write PGN file if we have moves
+    if (!pgnMoves.empty())
+    {
+        std::filesystem::create_directories("pgns");
+        int idx = 1;
+        std::string base;
+        do
+        {
+            base = "pgns/pgn" + std::to_string(idx) + ".pgn";
+            ++idx;
+        } while (std::filesystem::exists(base));
+
+        std::ofstream pf(base);
+        if (pf)
+        {
+            // header
+            std::time_t t = std::time(nullptr);
+            std::tm tm = *std::localtime(&t);
+            char datebuf[32];
+            std::snprintf(datebuf, sizeof(datebuf), "%04d.%02d.%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            pf << "[Event \"Friendly Game\"]\n";
+            pf << "[Site \"Local\"]\n";
+            pf << "[Date \"" << datebuf << "\"]\n";
+            pf << "[Round \"-\"]\n";
+            pf << "[White \"White\"]\n";
+            pf << "[Black \"Black\"]\n";
+            pf << "[Result \"" << gameResult << "\"]\n\n";
+
+            // movetext
+            for (size_t i = 0; i < pgnMoves.size(); ++i)
+            {
+                if (i % 2 == 0)
+                {
+                    pf << (i / 2 + 1) << ". ";
+                }
+                pf << pgnMoves[i];
+                if (i % 2 == 1)
+                    pf << ' ';
+                else
+                    pf << ' ';
+            }
+            pf << " " << gameResult << "\n";
+            pf.close();
+            std::cout << "Wrote PGN to " << base << "\n";
+        }
+        else
+        {
+            std::cout << "Failed to write PGN to " << base << "\n";
         }
     }
 
